@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cocoa Fermentary GIS Collector</title>
+  
+  <!-- Fixed Leaflet CSS Link -->
+  <link rel="stylesheet" href="https://unpkg.com" />
+  
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 15px; background: #f4f6f8; }
+    h2 { color: #2c5e1a; margin-top: 0; font-size: 1.3rem; }
+    .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 15px; }
+    label { display: block; font-weight: bold; margin-top: 10px; font-size: 0.9rem; color: #333; }
+    input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 1rem; }
+    input[readonly] { background-color: #e9ecef; color: #495057; }
+    button { width: 100%; padding: 12px; margin-top: 15px; border: none; border-radius: 5px; font-size: 1rem; font-weight: bold; cursor: pointer; }
+    .btn-gps { background: #007bff; color: white; }
+    .btn-submit { background: #2c5e1a; color: white; }
+    .btn-submit:disabled { background: #6c757d; cursor: not-allowed; }
+    #map { height: 220px; width: 100%; border-radius: 5px; margin-top: 10px; z-index: 1; }
+    .status { font-size: 0.85rem; margin-top: 8px; color: #555; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+  <h2>Cocoa Fermentary Data Collector</h2>
+
+  <div class="card">
+    <button type="button" class="btn-gps" onclick="getLocation()">📍 Capture GPS & Auto-Detect Boundary</button>
+    <div id="gpsStatus" class="status">Waiting for GPS signal...</div>
+    <div id="map"></div>
+
+    <label>Latitude *</label>
+    <input type="text" id="lat" readonly placeholder="Auto-filled">
+
+    <label>Longitude *</label>
+    <input type="text" id="lon" readonly placeholder="Auto-filled">
+
+    <label>GPS Accuracy (meters)</label>
+    <input type="text" id="accuracy" readonly placeholder="Auto-filled">
+
+    <label>District (Auto-detected from Boundary)</label>
+    <input type="text" id="district" placeholder="Will auto-fill or type manually">
+
+    <label>LLG (Auto-detected from Boundary)</label>
+    <input type="text" id="llg" placeholder="Will auto-fill or type manually">
+  </div>
+
+  <div class="card">
+    <form id="surveyForm" onsubmit="submitData(event)">
+      <label>Village / Ward Name *</label>
+      <input type="text" id="village" required placeholder="e.g., Omora / Ward 10">
+
+      <label>Fermentary Owner Full Name *</label>
+      <input type="text" id="ownerName" required placeholder="e.g., Paul Tongan">
+
+      <label>Phone Contact</label>
+      <input type="tel" id="phone" placeholder="e.g., 7XXXXXXX">
+
+      <label>Fermentary Status</label>
+      <select id="status">
+        <option value="Active / Operating">Active / Operating</option>
+        <option value="Needs Maintenance">Needs Maintenance</option>
+        <option value="Inactive / Abandoned">Inactive / Abandoned</option>
+        <option value="Under Construction">Under Construction</option>
+      </select>
+
+      <label>Additional Notes (e.g., Cooperative name, bags/month)</label>
+      <textarea id="notes" rows="2" placeholder="Optional details..."></textarea>
+
+      <button type="submit" class="btn-submit" id="submitBtn">☁️ Save & Upload Record</button>
+    </form>
+  </div>
+
+  <!-- Fixed Leaflet JS & Turf.js CDN Links -->
+  <script src="https://unpkg.com"></script>
+  <script src="https://unpkg.com"></script>
+
+  <script>
+    // PASTE YOUR GOOGLE APPS SCRIPT WEB APP URL HERE:
+    const SCRIPT_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL";
+
+    // Initialize Map centered on Morobe Province
+    const map = L.map('map').setView([-6.72, 146.99], 9);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    let marker;
+    let boundaryData = null;
+
+    // Load the converted Shapefile (boundaries.geojson)
+    fetch('boundaries.geojson')
+      .then(response => {
+        if (!response.ok) throw new Error("GeoJSON file not found");
+        return response.json();
+      })
+      .then(data => {
+        boundaryData = data;
+        L.geoJSON(data, {
+          style: { color: "#2c5e1a", weight: 1.5, fillOpacity: 0.05 }
+        }).addTo(map);
+      })
+      .catch(err => console.warn("Boundary layer skipped:", err.message));
+
+    function getLocation() {
+      const status = document.getElementById('gpsStatus');
+      if (!navigator.geolocation) {
+        status.textContent = "Geolocation is not supported by your browser.";
+        return;
+      }
+
+      status.textContent = "Acquiring high-accuracy GPS satellites...";
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const lat = position.coords.latitude;
+          const lon = position.coords.longitude;
+          const acc = position.coords.accuracy.toFixed(1);
+
+          document.getElementById('lat').value = lat.toFixed(6);
+          document.getElementById('lon').value = lon.toFixed(6);
+          document.getElementById('accuracy').value = acc + " m";
+          status.textContent = `✅ GPS Locked! Accuracy: ±${acc} meters`;
+
+          // Update Map
+          map.setView([lat, lon], 15);
+          if (marker) map.removeLayer(marker);
+          marker = L.marker([lat, lon]).addTo(map);
+
+          // Spatial Check: Find which District/LLG polygon contains this point
+          detectBoundary(lon, lat);
+        },
+        (error) => {
+          status.textContent = "❌ Error getting GPS: " + error.message;
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      );
+    }
+
+    function detectBoundary(lon, lat) {
+      if (!boundaryData) return;
+      const pt = turf.point([lon, lat]);
+
+      for (let feature of boundaryData.features) {
+        if (turf.booleanPointInPolygon(pt, feature)) {
+          // Match common PNG Census / Shapefile column names
+          const props = feature.properties;
+          const dist = props.DIST_NAME || props.District || props.DIST || "";
+          const llg = props.LLG_NAME || props.LLG || props.LLGNAME || "";
+          
+          document.getElementById('district').value = dist;
+          document.getElementById('llg').value = llg;
+          break;
+        }
+      }
+    }
+
+    function resetAllFields() {
+      document.getElementById('surveyForm').reset();
+      document.getElementById('lat').value = "";
+      document.getElementById('lon').value = "";
+      document.getElementById('accuracy').value = "";
+      document.getElementById('district').value = "";
+      document.getElementById('llg').value = "";
+      document.getElementById('gpsStatus').textContent = "Ready for next location...";
+      if (marker) {
+        map.removeLayer(marker);
+        marker = null;
+      }
+    }
+
+    function submitData(e) {
+      e.preventDefault();
+
+      const latVal = document.getElementById('lat').value;
+      const lonVal = document.getElementById('lon').value;
+
+      if (!latVal || !lonVal) {
+        alert("Please capture GPS coordinates first before saving.");
+        return;
+      }
+
+      if (SCRIPT_URL === "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL") {
+        alert("Please paste your Google Apps Script URL into the code first.");
+        return;
+      }
+
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = true;
+      btn.textContent = "Uploading...";
+
+      const payload = {
+        lat: latVal,
+        lon: lonVal,
+        accuracy: document.getElementById('accuracy').value,
+        district: document.getElementById('district').value,
+        llg: document.getElementById('llg').value,
+        village: document.getElementById('village').value,
+        ownerName: document.getElementById('ownerName').value,
+        phone: document.getElementById('phone').value,
+        status: document.getElementById('status').value,
+        notes: document.getElementById('notes').value
+      };
+
+      fetch(SCRIPT_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(payload)
+      })
+      .then(() => {
+        alert("✅ Fermentary data saved successfully!");
+        resetAllFields();
+        btn.disabled = false;
+        btn.textContent = "☁️ Save & Upload Record";
+      })
+      .catch(err => {
+        alert("❌ Upload failed. Check internet connection.");
+        btn.disabled = false;
+        btn.textContent = "☁️ Save & Upload Record";
+      });
+    }
+  </script>
+</body>
+</html>
